@@ -1,0 +1,14 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# VS Code
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+
+# OS
+.DS_Store
+Thumbs.db
