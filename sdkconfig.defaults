@@ -1,0 +1,17 @@
+# Use ESP32 target
+CONFIG_IDF_TARGET="esp32"
+
+# Keep FreeRTOS tick rate at 1000Hz (1ms tick) for fine-grained delays
+CONFIG_FREERTOS_HZ=1000
+
+# Enable verbose logging during development
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+
+# UART0 used for logging (default)
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Enable ISR stats for debugging
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
