@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "author": "Naman",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-bmp280",
+      "id": "bmp1",
+      "top": -80,
+      "left": 200,
+      "attrs": { "temperature": "28", "humidity": "60" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": 100,
+      "left": 200,
+      "attrs": { "color": "red", "label": "ISR Override" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 80,
+      "left": 200,
+      "attrs": { "value": "10000" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 100,
+      "left": 320,
+      "attrs": { "color": "green", "label": "ALERT" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r2",
+      "top": 130,
+      "left": 320,
+      "attrs": { "value": "220" }
+    }
+  ],
+  "connections": [
+    ["esp:22", "bmp1:SCL", "green", []],
+    ["esp:21", "bmp1:SDA", "yellow", []],
+    ["bmp1:VCC", "esp:3V3", "red", []],
+    ["bmp1:GND", "esp:GND.1", "black", []],
+
+    ["esp:3V3", "r1:1", "red", []],
+    ["r1:2",    "btn1:1.l", "orange", []],
+    ["esp:4",   "btn1:1.l", "blue", []],
+    ["btn1:2.l","esp:GND.2", "black", []],
+
+    ["esp:2",   "r2:1", "orange", []],
+    ["r2:2",    "led1:A", "orange", []],
+    ["led1:C",  "esp:GND.3", "black", []]
+  ]
+}

@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "build/firmware_sim.bin"
+elf = "build/firmware_sim.elf"
