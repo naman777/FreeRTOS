@@ -1,9 +1,12 @@
-/*
+﻿/*
  * FreeRTOS ESP32 sensor monitor
- * New in this commit: GPIO4 falling-edge ISR signals buttonSemaphore.
- * control_task polls it non-blocking after the queue receive.
- * Latency issue noted: button response is gated by sensor interval.
- * Will fix in next commit using a queue set.
+ * Upgrade: replaced non-blocking semaphore poll with FreeRTOS Queue Set.
+ * control_task now blocks on BOTH sensorQueue and buttonSemaphore
+ * simultaneously -- zero-latency button response regardless of sensor rate.
+ *
+ *   sensor_task --[reading]--> sensorQueue    --+
+ *                                               +--> Queue Set --> control_task
+ *   button ISR  --[give]----> buttonSemaphore --+
  */
 
 #include <stdio.h>
@@ -30,13 +33,13 @@ static const char *TAG = "FIRMWARE";
 static bmp280_calib_t    bmp_calib;
 static QueueHandle_t     sensorQueue;
 static SemaphoreHandle_t buttonSemaphore;
+static QueueSetHandle_t  controlQueueSet;
 
 typedef struct {
     float   temperature;
     int64_t timestamp_us;
 } sensor_reading_t;
 
-/* ISR: minimal -- no logging, no blocking, no heap ops */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
     BaseType_t higher_prio_woken = pdFALSE;
@@ -67,7 +70,9 @@ static void sensor_task(void *pvParameters)
                                     &bmp_calib, &temp) == ESP_OK) {
             reading.temperature  = temp;
             reading.timestamp_us = esp_timer_get_time();
-            xQueueSend(sensorQueue, &reading, pdMS_TO_TICKS(50));
+            if (xQueueSend(sensorQueue, &reading, pdMS_TO_TICKS(50)) != pdTRUE) {
+                ESP_LOGW(TAG, "sensorQueue full -- reading dropped");
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
@@ -77,19 +82,22 @@ static void control_task(void *pvParameters)
 {
     sensor_reading_t reading;
     while (1) {
-        /* Block waiting for sensor data (up to 1 s) */
-        if (xQueueReceive(sensorQueue, &reading, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        QueueSetMemberHandle_t active =
+            xQueueSelectFromSet(controlQueueSet, portMAX_DELAY);
+
+        if (active == sensorQueue) {
+            xQueueReceive(sensorQueue, &reading, 0);
             if (reading.temperature > ALERT_THRESHOLD_C) {
                 gpio_set_level(ALERT_LED_GPIO, 1);
-                ESP_LOGI(TAG, "ALERT: %.2f C", reading.temperature);
+                ESP_LOGI(TAG, "ALERT: %.2f C > threshold %.1f C",
+                         reading.temperature, ALERT_THRESHOLD_C);
             } else {
                 gpio_set_level(ALERT_LED_GPIO, 0);
             }
-        }
-        /* Non-blocking poll for button (latency = up to queue block time) */
-        if (xSemaphoreTake(buttonSemaphore, 0) == pdTRUE) {
+        } else if (active == buttonSemaphore) {
+            xSemaphoreTake(buttonSemaphore, 0);
             gpio_set_level(ALERT_LED_GPIO, 0);
-            ESP_LOGI(TAG, "button override: LED cleared");
+            ESP_LOGI(TAG, "button ISR: alert cleared by manual override");
         }
     }
 }
@@ -109,10 +117,15 @@ void app_main(void)
 
     sensorQueue     = xQueueCreate(10, sizeof(sensor_reading_t));
     buttonSemaphore = xSemaphoreCreateBinary();
+    controlQueueSet = xQueueCreateSet(10 + 1);
     configASSERT(sensorQueue);
     configASSERT(buttonSemaphore);
+    configASSERT(controlQueueSet);
+
+    xQueueAddToSet(sensorQueue,     controlQueueSet);
+    xQueueAddToSet(buttonSemaphore, controlQueueSet);
 
     xTaskCreate(sensor_task,  "sensor_task",  4096, NULL, 5, NULL);
     xTaskCreate(control_task, "control_task", 4096, NULL, 6, NULL);
-    ESP_LOGI(TAG, "boot: ISR on GPIO%d, LED on GPIO%d", BUTTON_GPIO, ALERT_LED_GPIO);
+    ESP_LOGI(TAG, "boot: queue set active -- zero-latency button response");
 }
