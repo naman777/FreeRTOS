@@ -1,21 +1,35 @@
 ﻿/*
- * FreeRTOS ESP32 sensor monitor
- * Upgrade: replaced non-blocking semaphore poll with FreeRTOS Queue Set.
- * control_task now blocks on BOTH sensorQueue and buttonSemaphore
- * simultaneously -- zero-latency button response regardless of sensor rate.
+ * FreeRTOS Multi-Task Sensor Monitor  (ESP32 + BMP280)
  *
- *   sensor_task --[reading]--> sensorQueue    --+
- *                                               +--> Queue Set --> control_task
- *   button ISR  --[give]----> buttonSemaphore --+
+ * Tasks:
+ *   sensor_task  (pri 5) -- reads BMP280 via I2C every 500 ms
+ *                           updates latest_reading (mutex), pushes to sensorQueue
+ *   control_task (pri 6) -- Queue Set: wakes on sensor data OR button press
+ *                           drives ALERT_LED based on temperature threshold
+ *   logger_task  (pri 4) -- reads latest_reading (mutex) every 1 s
+ *                           writes "t=... temp=..." line over UART
+ *
+ * Synchronisation:
+ *   sensorQueue      Queue (depth 10)   sensor_task -> control_task
+ *   dataMutex        Mutex              protects latest_reading (sensor <-> logger)
+ *   buttonSemaphore  Binary semaphore   ISR -> control_task
+ *   controlQueueSet  Queue Set          fans sensorQueue + buttonSemaphore
+ *
+ * Race condition demo:
+ *   Comment out the MUTEX GUARDS blocks in sensor_task and logger_task,
+ *   rebuild, and run.  The logger will print mismatched timestamp/temperature
+ *   pairs under load -- a classic TOCTOU race.  Re-enable to fix.
  */
 
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "bmp280.h"
@@ -30,8 +44,9 @@
 #define SENSOR_PERIOD_MS   500
 
 static const char *TAG = "FIRMWARE";
-static bmp280_calib_t    bmp_calib;
+
 static QueueHandle_t     sensorQueue;
+static SemaphoreHandle_t dataMutex;
 static SemaphoreHandle_t buttonSemaphore;
 static QueueSetHandle_t  controlQueueSet;
 
@@ -39,6 +54,9 @@ typedef struct {
     float   temperature;
     int64_t timestamp_us;
 } sensor_reading_t;
+
+static sensor_reading_t  latest_reading;
+static bmp280_calib_t    bmp_calib;
 
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
@@ -66,13 +84,25 @@ static void sensor_task(void *pvParameters)
     sensor_reading_t reading;
     while (1) {
         float temp;
-        if (bmp280_read_temperature(I2C_PORT, BMP280_ADDR_PRIMARY,
-                                    &bmp_calib, &temp) == ESP_OK) {
+        esp_err_t err = bmp280_read_temperature(I2C_PORT, BMP280_ADDR_PRIMARY,
+                                                 &bmp_calib, &temp);
+        if (err == ESP_OK) {
             reading.temperature  = temp;
             reading.timestamp_us = esp_timer_get_time();
+
+            /* ---- MUTEX GUARDS (comment out both blocks to reproduce race) ---- */
+            if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                latest_reading = reading;
+                xSemaphoreGive(dataMutex);
+            }
+
             if (xQueueSend(sensorQueue, &reading, pdMS_TO_TICKS(50)) != pdTRUE) {
                 ESP_LOGW(TAG, "sensorQueue full -- reading dropped");
             }
+        } else if (err == ESP_ERR_INVALID_RESPONSE) {
+            ESP_LOGW(TAG, "BMP280 not ready");
+        } else {
+            ESP_LOGE(TAG, "I2C error: %s", esp_err_to_name(err));
         }
         vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
@@ -102,6 +132,22 @@ static void control_task(void *pvParameters)
     }
 }
 
+/* ---- MUTEX GUARDS (comment out to reproduce race) ---- */
+static void logger_task(void *pvParameters)
+{
+    char buf[64];
+    while (1) {
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            int len = snprintf(buf, sizeof(buf), "t=%lld temp=%.2f\r\n",
+                               latest_reading.timestamp_us,
+                               latest_reading.temperature);
+            xSemaphoreGive(dataMutex);
+            uart_write_bytes(UART_NUM_0, buf, len);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void app_main(void)
 {
     i2c_master_init();
@@ -116,9 +162,11 @@ void app_main(void)
     gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL);
 
     sensorQueue     = xQueueCreate(10, sizeof(sensor_reading_t));
+    dataMutex       = xSemaphoreCreateMutex();
     buttonSemaphore = xSemaphoreCreateBinary();
     controlQueueSet = xQueueCreateSet(10 + 1);
     configASSERT(sensorQueue);
+    configASSERT(dataMutex);
     configASSERT(buttonSemaphore);
     configASSERT(controlQueueSet);
 
@@ -127,5 +175,8 @@ void app_main(void)
 
     xTaskCreate(sensor_task,  "sensor_task",  4096, NULL, 5, NULL);
     xTaskCreate(control_task, "control_task", 4096, NULL, 6, NULL);
-    ESP_LOGI(TAG, "boot: queue set active -- zero-latency button response");
+    xTaskCreate(logger_task,  "logger_task",  4096, NULL, 4, NULL);
+
+    ESP_LOGI(TAG, "boot: sensor=%dms threshold=%.1fC queue_set=yes",
+             SENSOR_PERIOD_MS, ALERT_THRESHOLD_C);
 }
